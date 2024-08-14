@@ -1,12 +1,12 @@
-import os
-import sys
+import os, sys
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 import lightning.pytorch as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pandas as pd
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 import modlee
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -22,7 +22,7 @@ modlee.init(api_key=os.environ['MODLEE_API_KEY'])
 
 print('Stage 1 Successful')
 
-# Importing Dataset and creating a dataframe
+### Importing Dataset and creating a dataframe
 file_path = './data/ecommerceDataset.csv'
 
 # Read the dataset
@@ -50,11 +50,11 @@ X = df['Text']
 y = df['Label']
 
 # Splitting the data into training and validation sets
-# X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # Combine X and y for DataLoader creation
-# train_df = pd.DataFrame({'Text': X_train, 'Label': y_train})
-# val_df = pd.DataFrame({'Text': X_val, 'Label': y_val})
+train_df = pd.DataFrame({'Text': X_train, 'Label': y_train})
+val_df = pd.DataFrame({'Text': X_val, 'Label': y_val})
 
 # Tokenizer and model from transformers
 tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
@@ -84,43 +84,63 @@ class TextDataset(Dataset):
             return_attention_mask=True,
             return_tensors='pt',
         )
-        # return {
-        #     'input_ids': encoding['input_ids'].squeeze(),
-        #     'attention_mask': encoding['attention_mask'].squeeze(),
-        #     'label': torch.tensor(label, dtype=torch.long)
-        # }
-        return encoding['input_ids'].squeeze(), encoding['attention_mask'].squeeze(), torch.tensor(label, dtype=torch.long)
-# Adjust these parameters as necessary
-MAX_LEN = 128
-BATCH_SIZE = 16
-
-
-dataset = TextDataset(X,y,tokenizer,MAX_LEN)
-
-
-# Split the dataset into training and validation sets
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-# Create DataLoaders
-train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
 
 # Create DataLoader
-# def create_data_loader(df, tokenizer, max_len, batch_size):
-#     ds = TextDataset(
-#         texts=df['Text'],
-#         labels=df['Label'],
-#         tokenizer=tokenizer,
-#         max_len=max_len
-#     )
-#     return DataLoader(ds, batch_size=batch_size, num_workers=4)
+def create_data_loader(df, tokenizer, max_len, batch_size):
+    ds = TextDataset(
+        texts=df['Text'],
+        labels=df['Label'],
+        tokenizer=tokenizer,
+        max_len=max_len
+    )
+    return DataLoader(ds, batch_size=batch_size, num_workers=4)
+
+# Adjust these parameters as necessary
+MAX_LEN = 128
+BATCH_SIZE = 32
+
+train_dataloader = create_data_loader(train_df, tokenizer, MAX_LEN, BATCH_SIZE)
+val_dataloader = create_data_loader(val_df, tokenizer, MAX_LEN, BATCH_SIZE)
 
 
+# Convert the batch to a list or tuple format before training starts
+class CustomDataloaderWrapper:
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
 
-# train_dataloader = create_data_loader(train_df, tokenizer, MAX_LEN, BATCH_SIZE)
-# val_dataloader = create_data_loader(val_df, tokenizer, MAX_LEN, BATCH_SIZE)
+    def __iter__(self):
+        for batch in self.dataloader:
+            # Convert the dictionary to a list or tuple
+            yield [batch['input_ids'], batch['attention_mask'], batch['label']]
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    @property
+    def batch_size(self):
+        return self.dataloader.batch_size
+
+    @property
+    def dataset(self):
+        return self.dataloader.dataset
+
+    @property
+    def sampler(self):
+        return self.dataloader.sampler
+
+    @property
+    def drop_last(self):
+        return self.dataloader.drop_last
+
+
+# Wrap the DataLoaders
+train_dataloader_wrapped = CustomDataloaderWrapper(train_dataloader)
+val_dataloader_wrapped = CustomDataloaderWrapper(val_dataloader)
 
 print('Stage 2 Successful')
 
@@ -131,23 +151,19 @@ class ModleeClassifier(modlee.model.ModleeModel):
         self.model = model
         self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, input_ids, attention_mask):
-        return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+    def forward(self, input_ids=None, attention_mask=None):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask)
 
     def training_step(self, batch, batch_idx):
-        input_ids = batch[0]
-        attention_mask = batch[1]
-        labels = batch[2]
+        input_ids, attention_mask, labels = batch
         outputs = self(input_ids=input_ids, attention_mask=attention_mask)
-        loss = self.loss_fn(outputs, labels)
+        loss = self.loss_fn(outputs.logits, labels)
         return {"loss": loss}
 
     def validation_step(self, val_batch, batch_idx):
-        input_ids = val_batch[0]
-        attention_mask = val_batch[1]
-        labels = val_batch[2]
+        input_ids, attention_mask, labels = val_batch
         outputs = self(input_ids=input_ids, attention_mask=attention_mask)
-        val_loss = self.loss_fn(outputs, labels)
+        val_loss = self.loss_fn(outputs.logits, labels)
         return {'val_loss': val_loss}
 
     def configure_optimizers(self):
@@ -160,33 +176,33 @@ modlee_model = ModleeClassifier()
 print("Stage 3 Successful")
 
 # Create a dummy input for ONNX export
-# dummy_input_ids = torch.randint(0, tokenizer.vocab_size, (1, MAX_LEN))
-# dummy_attention_mask = torch.ones(1, MAX_LEN)
-# dummy_input = (dummy_input_ids, dummy_attention_mask)
+dummy_input_ids = torch.randint(0, tokenizer.vocab_size, (1, MAX_LEN))
+dummy_attention_mask = torch.ones(1, MAX_LEN)
+dummy_input = (dummy_input_ids, dummy_attention_mask)
 
 with modlee.start_run() as run:
     trainer = pl.Trainer(max_epochs=1)
     trainer.fit(
         model=modlee_model,
-        train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader
+        train_dataloaders=train_dataloader_wrapped,
+        val_dataloaders=val_dataloader_wrapped
     )
 
 print("Stage 4 Successful")
 
 # Export the model to ONNX
-# torch.onnx.export(
-#     modlee_model,
-#     dummy_input,
-#     "model.onnx",
-#     input_names=["input_ids", "attention_mask"],
-#     output_names=["output"],
-#     dynamic_axes={
-#         "input_ids": {0: "batch_size", 1: "sequence"},
-#         "attention_mask": {0: "batch_size", 1: "sequence"},
-#         "output": {0: "batch_size"}
-#     }
-# )
+torch.onnx.export(
+    modlee_model,
+    dummy_input,
+    "model.onnx",
+    input_names=["input_ids", "attention_mask"],
+    output_names=["output"],
+    dynamic_axes={
+        "input_ids": {0: "batch_size", 1: "sequence"},
+        "attention_mask": {0: "batch_size", 1: "sequence"},
+        "output": {0: "batch_size"}
+    }
+)
 
 last_run_path = modlee.last_run_path()
 print(f"Run path: {last_run_path}")
